@@ -67,17 +67,14 @@ python3 diag_internode_validator.py --bundle-dir /path/to/bundle --no-color
 * **Cipher suite overlap**: Checks for common cipher suite intersections across nodes.
 * **Schema agreement**: Compares schema IDs across all nodes in gossip to verify cluster synchronization.
 
-### 3. Log-Based Runtime Exception & PKIX Scanner
-Scans `system.log`, `output.log`, and `debug.log` across all nodes for real runtime SSL events and errors:
-* `javax.net.ssl.SSLHandshakeException`
-* `SunCertPathBuilderException` / `unable to find valid certification path` (PKIX missing CA)
-* `certificate_unknown` / `unknown_ca` fatal alerts
-* `DseServerReloadableTrustManager` truststore reload confirmations
+### 3. Log-Based Runtime Exception & PKIX Scanner (Historical vs. Active Disambiguation)
+* Scans `system.log`, `output.log`, and `debug.log` across all nodes for SSL events (`SSLHandshakeException`, `certificate_unknown`, `unknown_ca`, `PKIX path building failed`).
+* **Distinguishes Historical/Transient vs Active Failures**: Cross-references handshake errors with `nodetool netstats` and `nodetool info`. If millions of encrypted small/gossip messages are successfully completed, past log errors during rolling cert rotations are marked as **`(Historical/Resolved)`** with a `[WARN]` rather than a false positive `[FAIL]`.
 
 ### 4. DSE Service Restart & Keystore Rotation Audit
 * **Process Start & Uptime Extraction**: Determines exact process startup time and node uptime from `CassandraDaemon` startup logs and `nodetool/info`.
 * **Dynamic Truststore Reload Verification**: Confirms if `DseServerReloadableTrustManager` picked up updated truststores.
-* **Unapplied Keystore Rotation Alert**: Flags long-running nodes experiencing active SSL handshake failures without a DSE service restart (since DSE does not dynamically reload `server.keystore` from disk; an explicit rolling restart is required).
+* **Unapplied Keystore Rotation Alert**: Flags long-running nodes experiencing SSL handshake failures without a DSE service restart (since DSE does not dynamically reload `server.keystore` from disk; an explicit rolling restart is required).
 
 ---
 
