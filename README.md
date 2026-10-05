@@ -74,6 +74,11 @@ Scans `system.log`, `output.log`, and `debug.log` across all nodes for real runt
 * `certificate_unknown` / `unknown_ca` fatal alerts
 * `DseServerReloadableTrustManager` truststore reload confirmations
 
+### 4. DSE Service Restart & Keystore Rotation Audit
+* **Process Start & Uptime Extraction**: Determines exact process startup time and node uptime from `CassandraDaemon` startup logs and `nodetool/info`.
+* **Dynamic Truststore Reload Verification**: Confirms if `DseServerReloadableTrustManager` picked up updated truststores.
+* **Unapplied Keystore Rotation Alert**: Flags long-running nodes experiencing active SSL handshake failures without a DSE service restart (since DSE does not dynamically reload `server.keystore` from disk; an explicit rolling restart is required).
+
 ---
 
 ## Exit Codes

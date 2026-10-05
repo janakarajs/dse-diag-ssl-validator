@@ -85,6 +85,11 @@ class NodeDiag:
     server_enc: dict = field(default_factory=dict)
     log_files: List[str] = field(default_factory=list)
     schema_id: str = ""
+    uptime_seconds: int = 0
+    proc_start_time: Optional[datetime.datetime] = None
+    truststore_load_times: List[datetime.datetime] = field(default_factory=list)
+    keystore_load_times: List[datetime.datetime] = field(default_factory=list)
+    yaml_mtime: Optional[datetime.datetime] = None
 
 
 # Known deprecated or insecure SSL/TLS protocols
@@ -206,13 +211,60 @@ class DiagBundleInternodeValidator:
                 except Exception:
                     pass
 
-            # Identify log files
+            # Parse nodetool/info for uptime
+            info_path = os.path.join(node_path, "nodetool", "info")
+            if os.path.isfile(info_path):
+                try:
+                    with open(info_path, "r", encoding="utf-8", errors="replace") as inf:
+                        for line in inf:
+                            if "Uptime (seconds)" in line:
+                                parts = line.split(":")
+                                if len(parts) > 1 and parts[1].strip().isdigit():
+                                    node.uptime_seconds = int(parts[1].strip())
+                                    break
+                except Exception:
+                    pass
+
+            # Parse process start time and truststore/keystore reload events from logs
             log_dir = os.path.join(node_path, "logs", "cassandra")
             if os.path.isdir(log_dir):
-                for lf in ["system.log", "output.log", "debug.log"]:
+                for lf in ["output.log", "system.log", "debug.log"]:
                     full_lp = os.path.join(log_dir, lf)
                     if os.path.isfile(full_lp):
                         node.log_files.append(full_lp)
+                        try:
+                            with open(full_lp, "r", encoding="utf-8", errors="replace") as lf_h:
+                                for line in lf_h:
+                                    # Process start
+                                    if "CassandraDaemon.java" in line and "Process information PID" in line and not node.proc_start_time:
+                                        ts_m = re.search(r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})", line)
+                                        if ts_m:
+                                            try:
+                                                node.proc_start_time = datetime.datetime.strptime(ts_m.group(1), "%Y-%m-%d %H:%M:%S")
+                                            except Exception:
+                                                pass
+                                    # Truststore reload
+                                    if "Reloading TrustStore from" in line:
+                                        ts_m = re.search(r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})", line)
+                                        if ts_m:
+                                            try:
+                                                dt = datetime.datetime.strptime(ts_m.group(1), "%Y-%m-%d %H:%M:%S")
+                                                if dt not in node.truststore_load_times:
+                                                    node.truststore_load_times.append(dt)
+                                            except Exception:
+                                                pass
+                                    # Keystore reload
+                                    if "Reloading KeyStore from" in line or "Reloading keystore" in line:
+                                        ts_m = re.search(r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})", line)
+                                        if ts_m:
+                                            try:
+                                                dt = datetime.datetime.strptime(ts_m.group(1), "%Y-%m-%d %H:%M:%S")
+                                                if dt not in node.keystore_load_times:
+                                                    node.keystore_load_times.append(dt)
+                                            except Exception:
+                                                pass
+                        except Exception:
+                            pass
 
             self.nodes[node.ip] = node
 
@@ -384,6 +436,40 @@ class DiagBundleInternodeValidator:
             self.findings.append(Finding(
                 node.ip, "log_ssl_health", "PASS",
                 f"No SSL/TLS handshake errors or PKIX exceptions detected in {len(node.log_files)} log file(s)."
+            ))
+
+        # ── Service Restart / Keystore & Truststore Reload Check ──
+        # DSE provides dynamic reload of truststores (DseServerReloadableTrustManager)
+        # but keystores require a full DSE service restart to pick up rotated certificates.
+        if node.proc_start_time:
+            self.findings.append(Finding(
+                node.ip, "dse_process_start", "INFO",
+                f"DSE service started: {node.proc_start_time.strftime('%Y-%m-%d %H:%M:%S UTC')} "
+                f"(Uptime: {node.uptime_seconds // 86400}d {(node.uptime_seconds % 86400) // 3600}h {(node.uptime_seconds % 3600) // 60}m)"
+            ))
+
+        if node.truststore_load_times:
+            latest_ts_load = max(node.truststore_load_times)
+            self.findings.append(Finding(
+                node.ip, "truststore_reload_event", "PASS",
+                f"DseServerReloadableTrustManager active — Truststore loaded at {latest_ts_load.strftime('%Y-%m-%d %H:%M:%S UTC')}."
+            ))
+        else:
+            self.findings.append(Finding(
+                node.ip, "truststore_reload_event", "INFO",
+                "No dynamic truststore reload events recorded in current log window."
+            ))
+
+        # Check for certificate rotation restart necessity
+        # If there are SSL handshake errors and the node has been running continuously for a long period without restart,
+        # alert that a rolling restart is needed if keystores/certs were updated on disk.
+        if matched_errors:
+            start_str = node.proc_start_time.strftime('%Y-%m-%d %H:%M:%S UTC') if node.proc_start_time else f"{node.uptime_seconds}s uptime"
+            self.findings.append(Finding(
+                node.ip, "cert_rotation_restart_check", "WARN",
+                f"Node has active SSL handshake errors while running continuously since {start_str}. "
+                "Note: DSE requires a full rolling restart of DSE service to load new certificates from server.keystore (keystores are not dynamically reloaded).",
+                "If keystores or certificates were updated/rotated on disk, perform a rolling restart: 'sudo systemctl restart dse'"
             ))
 
     def validate_cluster_consistency(self):
