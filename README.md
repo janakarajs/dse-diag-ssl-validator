@@ -1,8 +1,8 @@
 # DSE Diagnostic Bundle Internode SSL Validator
 
-A standalone Python validator for checking and comparing **Internode SSL/TLS health** across DSE / Apache Cassandra cluster nodes directly from an unpacked diagnostic bundle (`proddsecluster-diagnostics-*.tar.gz`).
+A standalone Python validator for checking and comparing **Internode SSL/TLS health** across DSE / Apache Cassandra cluster nodes directly from an unpacked diagnostic bundle.
 
-Designed specifically for support engineers, DBAs, and SREs to run on local jump boxes, diagnostic servers, or ECU/support repositories **without needing SSH credentials or direct connectivity to customer environments**.
+Designed specifically for support engineers to run on Ecurep jump boxes, diagnostic server **without needing SSH credentials or direct connectivity to customer environments**.
 
 ---
 
