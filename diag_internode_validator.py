@@ -98,6 +98,10 @@ class NodeDiag:
     small_messages_completed: int = 0
     large_messages_completed: int = 0
     gossip_messages_completed: int = 0
+    # Additional internode & cluster configuration details
+    internode_compression: str = ""
+    seed_list: List[str] = field(default_factory=list)
+    snitch: str = ""
 
 
 # Known deprecated or insecure SSL/TLS protocols
@@ -105,15 +109,13 @@ DEPRECATED_PROTOCOLS = {"SSL", "SSLV2", "SSLV3", "TLSV1", "TLSV1.0", "TLSV1.1"}
 
 # Regex patterns for SSL errors in logs
 SSL_LOG_PATTERNS = [
-    (r"SSLHandshakeException", "SSL handshake failed", "FAIL", "Verify certificates, truststore CA bundles, and cipher suites."),
-    (r"SunCertPathBuilderException|unable to find valid certification path", "PKIX path building failed (CA missing in truststore)", "FAIL", "Import signing CA into server.truststore on this node."),
-    (r"certificate_unknown", "Peer sent unknown certificate alert", "FAIL", "Verify that peer certificate is issued by a trusted CA present in truststore."),
-    (r"unknown_ca", "Peer rejected certificate due to unknown CA", "FAIL", "Add issuing CA to the peer's truststore."),
+    (r"SunCertPathBuilderException|unable to find valid certification path", "PKIX CA path building failed", "FAIL", "Import signing CA into server.truststore on this node."),
+    (r"certificate_unknown", "Peer sent fatal certificate_unknown alert", "FAIL", "Verify that peer certificate is signed by a trusted CA present in truststore."),
+    (r"unknown_ca", "Peer rejected connection due to unknown CA", "FAIL", "Add issuing CA to the peer node's truststore."),
     (r"Keystore was tampered with, or password was incorrect", "Keystore corruption or invalid password", "FAIL", "Verify keystore integrity and passwords in cassandra.yaml."),
     (r"No appropriate protocol.*\(protocol is disabled or cipher suites are inappropriate\)", "TLS protocol / cipher suite negotiation failure", "FAIL", "Align protocol and cipher_suites in cassandra.yaml across all nodes."),
-    (r"javax\.net\.ssl\.SSLException: Received fatal alert", "Fatal SSL alert during internode communication", "FAIL", "Check peer node logs to identify the exact rejection reason."),
+    (r"SSLHandshakeException", "SSL handshake failure", "FAIL", "Verify certificates, truststore CA bundles, and cipher suites."),
     (r"DseServerReloadableTrustManager.*Reloading TrustStore", "Truststore reloaded successfully", "INFO", ""),
-    (r"Handshaking version .* with /([0-9.]+)", "MessagingService connection established", "INFO", ""),
 ]
 
 
@@ -171,6 +173,15 @@ class DiagBundleInternodeValidator:
                             node.yaml_data = yaml.safe_load(yf) or {}
                             node.server_enc = node.yaml_data.get("server_encryption_options") or {}
                             node.listen_address = node.yaml_data.get("listen_address", node.ip)
+                            node.internode_compression = node.yaml_data.get("internode_compression", "none")
+                            node.snitch = node.yaml_data.get("endpoint_snitch", "")
+                            # Parse seeds list
+                            sp = node.yaml_data.get("seed_provider", [])
+                            if isinstance(sp, list) and len(sp) > 0:
+                                params = sp[0].get("parameters", [])
+                                if params and isinstance(params, list):
+                                    seeds_str = params[0].get("seeds", "")
+                                    node.seed_list = [s.strip() for s in seeds_str.split(",") if s.strip()]
                     except Exception as e:
                         self.findings.append(Finding(
                             node.ip, "cassandra_yaml_parse", "FAIL",
@@ -511,9 +522,8 @@ class DiagBundleInternodeValidator:
             ))
 
         # Check for certificate rotation restart necessity
-        # If there are SSL handshake errors and the node has been running continuously for a long period without restart,
-        # alert that a rolling restart is needed if keystores/certs were updated on disk.
-        if matched_errors:
+        # Only alert for restart if live communication is NOT verified healthy.
+        if matched_errors and not is_actively_communicating:
             start_str = node.proc_start_time.strftime('%Y-%m-%d %H:%M:%S UTC') if node.proc_start_time else f"{node.uptime_seconds}s uptime"
             self.findings.append(Finding(
                 node.ip, "cert_rotation_restart_check", "WARN",
@@ -620,6 +630,36 @@ class DiagBundleInternodeValidator:
             self.findings.append(Finding(
                 "cluster", "schema_disagreement", "WARN",
                 f"Multiple schema versions detected ({len(schema_set)} versions). Cluster may be undergoing schema migration or gossip is degraded."
+            ))
+
+        # 7. Internode Compression Consistency Check
+        comp_map = {n.ip: n.internode_compression for n in node_list if n.internode_compression}
+        if len(set(comp_map.values())) > 1:
+            detail = ", ".join(f"{ip}={val}" for ip, val in comp_map.items())
+            self.findings.append(Finding(
+                "cluster", "inconsistent_internode_compression", "WARN",
+                f"Mismatched internode_compression across cluster: {detail}",
+                "Ensure internode_compression ('all', 'dc', 'none') is aligned across all nodes."
+            ))
+        elif comp_map:
+            self.findings.append(Finding(
+                "cluster", "internode_compression_consistency", "PASS",
+                f"All nodes agree on internode_compression: '{list(set(comp_map.values()))[0]}'"
+            ))
+
+        # 8. Seed List Alignment Check
+        seeds_tuple_map = {n.ip: tuple(sorted(n.seed_list)) for n in node_list if n.seed_list}
+        if len(set(seeds_tuple_map.values())) > 1:
+            self.findings.append(Finding(
+                "cluster", "seed_list_inconsistent", "WARN",
+                "Seed lists differ across nodes in cassandra.yaml. This can cause split-brain or asymmetric gossip rings during SSL restart.",
+                "Ensure all nodes have identical seed_provider parameters."
+            ))
+        elif seeds_tuple_map:
+            first_seeds = list(list(seeds_tuple_map.values())[0])
+            self.findings.append(Finding(
+                "cluster", "seed_list_consistency", "PASS",
+                f"All nodes configure identical cluster seeds: {first_seeds}"
             ))
 
     def run(self) -> int:
